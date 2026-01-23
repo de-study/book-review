@@ -245,3 +245,19 @@ Spark의 목표:
 - Python 편의성 제공
 - 실시간 대화형 지원
 ```
+
+### context, session
+- SparkContext: Spark 1.x 시절의 클러스터 연결 진입점 (RDD 전용)
+- SparkSession: Spark 2.0+의 통합 진입점 (RDD, DataFrame, SQL 모두 지원)
+
+- context가 나온이유
+ - Spark가 발전하면서:
+  - DataFrame API 추가 → SQLContext 필요
+  - Streaming 추가 → StreamingContext 필요
+  - Hive 연동 → HiveContext 필요
+
+- SparkSession (현세대)
+ - 발생 배경
+ - Spark 2.0에서 여러 Context를 하나로 통합:
+  - 이전 기술의 한계: Context가 너무 많아 복잡함
+  - 해결 방법: 단일 진입점으로 통합
