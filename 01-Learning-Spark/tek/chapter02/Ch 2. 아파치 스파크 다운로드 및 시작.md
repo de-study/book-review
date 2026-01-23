@@ -88,3 +88,7 @@
 ## 스파크 UI
 **스파크는 GUI를 써서 스파크 애플리케이션을 살펴볼 수 있게 해주며, 다양한 레벨 (잡, 스테이지, 태스크 레벨)에서 확인 가능하다.**
 - UI는 스파크 내부의 작업에 대한 디버깅과 검사 도구로서 현미경 역할을 한다.
+
+## References
+- https://na0-0.tistory.com/158
+- https://anyflip.com/zakdl/bkqz/basic
