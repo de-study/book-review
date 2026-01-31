@@ -280,17 +280,451 @@ SQL: createOrReplaceTempView, sql
 - Spark는 자체 타입 시스템 보유
 - Python/Java 타입을 Spark 타입으로 변환해서 처리  
 
-### 1단계: 타입 시스템 개요
-발생 배경
-문제
+### 1단계: type 시스템 개요
 
-Python: int, str, list
-Java: Integer, String, ArrayList
-Scala: Int, String, List
-각 언어마다 타입 다름
+**문제상황**
+> "각 언어마다 타입이 다르잖아. Spark는 이 모든 언어를 지원해야 하는데, 어떻게 통일하지?"
+```
+Python : int, str, list
+Java   : Integer, String, ArrayList
+Scala  : Int, String, List
+```
 
-해결책
+**해결책**
+> "아, Spark 자체 타입 시스템을 만들어서 중간에서 변환하는 거네."  
+> "JVM에서 실행되니까 결국 Java 타입 기반이긴 한데, 각 언어에서 쉽게 쓸 수 있게 래핑한 거야."
+- Spark 자체 타입 정의
+- 모든 언어를 Spark 타입으로 통일
+- JVM에서 실행되므로 Java 기반
 
-Spark 자체 타입 정의
-모든 언어를 Spark 타입으로 통일
-JVM에서 실행되므로 Java 기반
+**스키마선언 방법**
+- 0) 스키마 선언
+	- ```
+	  from pyspark.sql.types import *
+
+		schema = StructType([
+		    StructField("user_id", IntegerType(), False),
+		    StructField("is_active", BooleanType(), True),
+		    StructField("created_at", DateType(), True)
+		])
+
+	  ```
+- 1) DataFrame 생성 시 직접 지정
+	- ```
+	  df = spark.createDataFrame(data, schema)
+	  ```
+- 2) 파일 읽을 때 지정 (실무 핵심)
+	- ```
+	  df = spark.read \
+			    .schema(schema) \
+			    .csv("s3://bucket/users.csv")
+	  ```
+- 3) 테이블에서 상속 (가장 안정적)
+	- ```
+	df = spark.read.table("analytics.users")
+	  ```
+- 기본적으로 parquet에 타입이 설정되어있어서(강제) 지정안해도됨.  
+
+### 2단계: 기본타입 및 설정방법
+
+**1) 숫자타입**
+
+```
+from pyspark.sql.types import *
+
+# 정수
+ByteType()      # 8-bit 정수 (-128 ~ 127)
+ShortType()     # 16-bit 정수 (-32768 ~ 32767)
+✅IntegerType()   # 32-bit 정수 (일반적 사용)
+LongType()      # 64-bit 정수 (큰 수)
+
+# 실수
+FloatType()     # 32-bit 부동소수점
+DoubleType()    # 64-bit 부동소수점 (권장)
+
+# 고정소수점
+DecimalType(precision, scale)  # 금융 계산용
+# DecimalType(10, 2) → 12345678.90
+```
+
+- 설정팁
+```
+# 정수
+- ByteType, ShortType → 거의 안 씀. 메모리 극한 최적화할 때만.
+- IntegerType → 일반적인 숫자 (나이, 개수)
+- LongType → 큰 숫자 (사용자 ID, timestamp)
+
+# 실수
+"FloatType vs DoubleType는... 
+- 과학 계산이면 DoubleType이 정밀도 높아서 이거 쓰고."
+
+# 고정소수점
+- 나쁜 예: 금액을 DoubleType으로
+	amount = DoubleType()  # 999.99 + 0.01 = 1000.0000000001 (버그!)
+
+- 좋은 예: 금액을 DecimalType으로  
+	amount = DecimalType(12, 2)  # 정확히 1000.00
+```
+
+**2) 문자열/날짜**
+
+```
+StringType()    # 문자열, UTF-8 문자열 (무제한 길이)
+BinaryType()    # 바이트 배열
+
+BooleanType()   # True/False
+
+DateType()      # 날짜만 (2025-01-30)
+TimestampType() # 날짜+시간 (2025-01-30 15:30:00)
+```
+
+- 설정팁
+```
+# 날짜
+"DateType vs TimestampType
+- 생일 같은 건 Date
+- 로그 분석할 때 시간까지 필요하면 Timestamp 
+```
+
+**3) 복합 타입**
+- ArrayType (배열)
+	- "오, array 안에 element 타입이 정의되네. Python list랑 비슷한데 타입이 명시되어 있어."
+```
+from pyspark.sql.types import ArrayType, IntegerType
+
+# 정수 배열
+ArrayType(IntegerType())
+
+# 문자열 배열
+ArrayType(StringType())
+
+data = [
+    (1, [101, 102, 103]),  # user_id: 1, 구매한 product_ids
+    (2, [201])
+]
+
+df = spark.createDataFrame(data, ["user_id", "product_ids"])
+
+df.printSchema()
+# root
+#  |-- user_id: long
+#  |-- product_ids: array
+#      |-- element: long
+
+```
+- MapType (딕셔너리)
+	- "실무에서 언제 쓰나 생각해보면... 설정 값이나 메타데이터 저장할 때 유용하겠네."
+```
+from pyspark.sql.types import MapType
+
+# 문자열 → 정수 맵
+MapType(StringType(), IntegerType())
+
+
+
+data = [
+    (1, {"math": 90, "english": 85}),
+    (2, {"math": 75, "english": 95})
+]
+
+df = spark.createDataFrame(data, ["id", "scores"])
+
+df.printSchema()
+# root
+#  |-- id: long
+#  |-- scores: map
+#      |-- key: string
+#      |-- value: long
+```
+- StructType (중첩 구조)
+	- "address가 또 StructType이네. 중첩 구조. JSON이랑 완전 똑같은 구조야."
+```
+from pyspark.sql.types import StructType, StructField
+
+# 스키마 정의
+schema = StructType([
+    StructField("name", StringType(), nullable=False),
+    StructField("age", IntegerType(), nullable=True),
+    StructField("address", StructType([
+        StructField("city", StringType()),
+        StructField("zip", StringType())
+    ]))
+])
+
+
+data = [
+    ("Alice", 25, {"city": "Seoul", "zip": "12345"}),
+    ("Bob", 30, {"city": "Busan", "zip": "67890"})
+]
+
+df = spark.createDataFrame(data, schema)
+
+df.printSchema()
+# root
+#  |-- name: string (nullable = false)
+#  |-- age: integer (nullable = true)
+#  |-- address: struct
+#      |-- city: string
+#      |-- zip: string
+```
+
+### 3단계 스키마 정의방법
+
+**방법1.자동추론**
+- 항상 정확하지 않음
+- 성능 오버헤드 (데이터 스캔 필요)
+```
+data = [("Alice", 25), ("Bob", 30)]
+
+# Spark가 자동 타입 추론
+df = spark.createDataFrame(data, ["name", "age"])
+
+df.printSchema()
+# root
+#  |-- name: string
+#  |-- age: long (자동으로 long 선택)
+```
+**방법 2: DDL 문자열**
+- 간단한 스키마
+- "오, SQL 스타일이라 읽기 편하네."
+- "근데 nullable 제어가 안 되네... 그럼 복잡한 건 못 쓰겠어."
+```
+# SQL DDL 스타일
+schema_ddl = "name STRING, age INT, salary DOUBLE"
+
+df = spark.createDataFrame(data, schema_ddl)
+```
+**방법 3: StructType 명시**
+- "이게 제일 명확하고 안전해."
+- 타입 완전 제어
+- nullable 지정 가능
+- 프로덕션 권장
+- "user_id가 NULL이면 안 되잖아. 이런 거 명시해야 나중에 데이터 품질 문제 안 생겨."
+```
+from pyspark.sql.types import *
+
+schema = StructType([
+    StructField("name", StringType(), nullable=False), # NOT NULL
+    StructField("age", IntegerType(), nullable=True),
+    StructField("salary", DoubleType(), nullable=True)
+])
+
+df = spark.createDataFrame(data, schema)
+
+```
+
+**스키마선언 사용방법**
+- 0) 스키마 선언 - 방법3
+	- ```
+	  from pyspark.sql.types import *
+
+		schema = StructType([
+		    StructField("user_id", IntegerType(), False),
+		    StructField("is_active", BooleanType(), True),
+		    StructField("created_at", DateType(), True)
+		])
+
+	  ```
+- 1) DataFrame 생성 시 직접 지정
+	- ```
+	  df = spark.createDataFrame(data, schema)
+	  ```
+- 2) 파일 읽을 때 지정 (실무 핵심)
+	- ```
+	  df = spark.read \
+			    .schema(schema) \
+			    .csv("s3://bucket/users.csv")
+	  ```
+- 3) 테이블에서 상속 (가장 안정적)
+	- ```
+	df = spark.read.table("analytics.users")
+	  ```
+- 기본적으로 parquet에 타입이 설정되어있어서(강제) 지정안해도됨.  
+
+
+### 4단계 타입변환 
+> "CSV 읽으면 전부 문자열로 오는데, 어떻게 숫자로 바꾸지?"
+
+- 캐스팅 예시
+```
+from pyspark.sql.functions import col
+
+df = spark.createDataFrame([
+    ("1", "100"),
+    ("2", "200")
+], ["id", "amount"])
+
+# 문자열 → 정수
+df = df.withColumn("id", col("id").cast(IntegerType()))
+df = df.withColumn("amount", col("amount").cast(DoubleType()))
+
+# 또는 문자열로
+df = df.withColumn("id", col("id").cast("int"))
+df = df.withColumn("amount", col("amount").cast("double"))
+
+df.printSchema()
+# root
+#  |-- id: integer
+#  |-- amount: double
+```
+
+
+- cast실패하면 null처리됨
+	- "abc" → IntegerType 캐스팅 → NULL
+	- "NULL로 변하네. 조용히 실패하니까 확인해야겠어."
+```
+# 변환 후 검증 
+df.filter(col("age").cast("int").isNotNull())
+```
+
+- 관련 코드
+```
+# 구조 확인
+df.printSchema()
+
+# 스키마 객체 가져오기
+schema = df.schema
+print(schema)
+
+# 특정 컬럼 타입
+print(df.schema["age"].dataType)  # IntegerType
+
+
+# 숫자형 컬럼만
+numeric_cols = [f.name for f in df.schema.fields 
+                if isinstance(f.dataType, (IntegerType, DoubleType, LongType))]
+
+# 문자열 컬럼만
+string_cols = [f.name for f in df.schema.fields 
+               if isinstance(f.dataType, StringType)]
+```
+
+### 5단계 파이썬 매핑 주의사항
+
+**Python vs Spark 타입 매핑**
+- "Python 데이터를 createDataFrame하면 자동 변환되는데..."
+```
+Python          → Spark
+------------------------------
+None            → NULL
+bool            → BooleanType
+int             → LongType (주의: IntegerType 아님)
+float           → DoubleType
+str             → StringType
+bytes           → BinaryType
+datetime.date   → DateType
+datetime.datetime → TimestampType
+list            → ArrayType
+dict            → MapType
+```
+
+
+**Python(int) → LongType**
+- "어? int가 LongType이네? IntegerType 아니고?"
+- "왜 long으로 추론하지? 아, Python int는 크기 제한 없어서 안전하게 LongType으로 매핑하는구나."
+- "IntegerType 원하면 명시해야 해."
+```
+data = [(1, 2), (3, 4)]
+df = spark.createDataFrame(data, ["a", "b"])
+
+df.printSchema()
+# root
+#  |-- a: long (int 아님!)
+#  |-- b: long
+
+# 명시적으로 지정해주기
+schema = StructType([
+    StructField("a", IntegerType()),
+    StructField("b", IntegerType())
+])
+```
+
+
+### 6단계 null 처리 주의사항
+
+**nullable False여도 에러안남**
+- "nullable=False로 하면 NULL 들어오면 에러나나?"
+- "아니, 경고만 하고 받아들여... Spark가 관대해. 그래서 더 위험해."
+- "검증하는 출력문 작성해야해"
+
+```
+StructField("user_id", IntegerType(), nullable=False)
+
+
+## 읽을 때 검증
+df = spark.read.csv("data.csv", schema=schema)
+
+# NULL 체크
+null_count = df.filter(col("user_id").isNull()).count()
+if null_count > 0:
+    raise ValueError(f"user_id에 NULL {null_count}개 발견!")
+
+```
+
+**Null처리함수**
+- "실무에선 fillna보다는 명시적으로 처리하는 게 나아."
+```
+# NULL 필터
+df.filter(col("age").isNotNull())
+
+# NULL 제거
+df.dropna(subset=["age"])
+
+# NULL 채우기
+df.fillna({"age": 0, "name": "Unknown"})
+
+
+# 명시적처리
+from pyspark.sql.functions import when, col
+
+df = df.withColumn("age_clean",
+    when(col("age").isNull(), 0)
+    .otherwise(col("age"))
+)
+```
+
+### 7단계 - 복잡한 타입 다루기
+
+**배열 컬럼 접근**
+- "explode... 배열 한 개가 여러 행으로 펼쳐지네."
+- "로그 분석할 때 유용하겠어. 한 사용자가 여러 이벤트 발생시킨 거 펼칠 때."
+```
+from pyspark.sql.functions import explode, col
+
+data = [(1, ["A", "B", "C"])]
+df = spark.createDataFrame(data, ["id", "items"])
+
+# 배열 분해 (각 요소를 행으로)
+df.select(col("id"), explode(col("items")).alias("item")).show()
+# +---+----+
+# | id|item|
+# +---+----+
+# |  1|   A|
+# |  1|   B|
+# |  1|   C|
+# +---+----+
+
+# 배열 인덱스 접근
+df.select(col("items")[0].alias("first_item")).show()
+```
+**Map 컬럼 접근**
+```
+data = [(1, {"math": 90, "eng": 85})]
+df = spark.createDataFrame(data, ["id", "scores"])
+
+# 키로 접근
+df.select(col("scores")["math"]).show()
+```
+**Struct 컬럼 접근**
+- "JSON 경로 탐색하는 것처럼 점 찍어서 접근. 직관적이야."
+```
+# 점 표기법
+df.select(col("address.city"), col("address.zip"))
+
+# getField
+df.select(col("address").getField("city"))
+```
+
+
+
+
