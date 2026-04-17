@@ -181,7 +181,7 @@ df.write.jdbc(
 )
 ```
 
-> **현장 노트** — `numPartitions` 없이 대용량 테이블을 읽으면 Spark가 단일 태스크로 전체를 읽어 드라이버 OOM 발생.  
+> **트러블 로그** — `numPartitions` 없이 대용량 테이블을 읽으면 Spark가 단일 태스크로 전체를 읽어 드라이버 OOM 발생.  
 > 예: 5천만 건 orders 테이블을 `numPartitions` 없이 읽으면 드라이버 메모리 8GB가 통째로 채워져 파이프라인이 죽음.  
 > `partitionColumn`은 `order_id` 같은 균등 분포된 정수형 PK를 사용할 것. `created_at` 같은 datetime은 특정 날짜에 데이터가 몰릴 경우 파티션 skew 발생.
 
@@ -298,7 +298,7 @@ spark.sql("""
 """)
 ```
 
-> **현장 노트** — 파티션 컬럼을 잘못 고르면 오히려 성능이 크게 나빠짐.  
+> **트러블 로그** — 파티션 컬럼을 잘못 고르면 오히려 성능이 크게 나빠짐.  
 > 예: `user_id`로 파티셔닝하면 MAU 100만 기준 하루에만 수백만 개의 소파일 생성.  
 > S3에서 `LIST` 호출 한 번에 최대 1,000개 객체만 반환하므로, 파일 수가 많아질수록 메타데이터 조회만으로 수십 초 소요.  
 > 일반적으로 `year/month/day` 계층 구조가 가장 무난하며, 쿼리 패턴에서 가장 자주 필터링하는 컬럼을 기준으로 선택할 것.
@@ -505,7 +505,7 @@ spark.sql("CREATE TABLE loans USING delta LOCATION '/delta/loans/'")
 spark.sql("SELECT * FROM loans WHERE loan_status = 'active'").show()
 ```
 
-> **현장 노트** — `overwrite` 모드는 기존 데이터를 전부 덮어씀.  
+> **트러블 로그** — `overwrite` 모드는 기존 데이터를 전부 덮어씀.  
 > Delta Lake는 이를 트랜잭션으로 처리하므로 쓰기 중 쿼리가 들어와도 이전 스냅샷을 읽음.  
 > 하지만 운영 중인 테이블에 실수로 `overwrite`를 날린 적이 있다면, 이전 데이터로 되돌리려면 타임 트래블이 필요.  
 > 습관적으로 `append`를 기본값으로 쓰고, `overwrite`는 의도적인 경우에만 명시할 것.
@@ -624,7 +624,7 @@ new_df.write.format("delta").mode("append").save("/delta/loans/")
 # AnalysisException: A schema mismatch detected when writing to the Delta table.
 ```
 
-> **현장 노트** — 스키마 강제는 데이터 품질의 첫 번째 방어선.  
+> **트러블 로그** — 스키마 강제는 데이터 품질의 첫 번째 방어선.  
 > 운영 중 파이프라인에서 갑자기 `AnalysisException`이 뜨면 십중팔구 업스트림 스키마 변경이 원인.  
 > 예: 광고팀이 클릭 이벤트 스키마에 `campaign_id` 컬럼을 추가했는데 알림 없이 배포 → 하위 파이프라인 전체 중단.  
 > 이런 상황이 반복되지 않도록 업스트림 팀과 **스키마 변경 알림 프로세스**를 사전에 합의해 둘 것.
@@ -712,7 +712,7 @@ delta_table.delete("borrower_id = 'user_12345'")
 )
 ```
 
-> **현장 노트** — `MERGE`는 강력하지만 대규모 테이블에서 성능 저하가 심할 수 있음.  
+> **트러블 로그** — `MERGE`는 강력하지만 대규모 테이블에서 성능 저하가 심할 수 있음.  
 > 예: 1억 건 테이블에 1만 건 MERGE를 날렸는데 전체 스캔이 발생해 30분이 걸린 사례도 있음.  
 > 조인 키(`loan_id`)가 파티션 컬럼과 일치하는지 먼저 확인하고,  
 > `spark.databricks.delta.merge.repartitionBeforeWrite.enabled`를 활성화해 쓰기 skew를 방지할 것.
@@ -821,7 +821,7 @@ loans_before_delete.write \
     .save("/delta/loans/")            # 복구 완료
 ```
 
-> **현장 노트** — `VACUUM`은 기본적으로 7일 이전 파일을 삭제함.  
+> **트러블 로그** — `VACUUM`은 기본적으로 7일 이전 파일을 삭제함.  
 > 타임 트래블 범위가 줄어들기 때문에, 처음 테이블을 만들 때부터 보관 기간을 명시적으로 설정해 두는 것이 좋음.  
 > 예: 감사 목적으로 30일치 이력이 필요하다면 `ALTER TABLE loans SET TBLPROPERTIES ('delta.logRetentionDuration' = 'interval 30 days')`.  
 > 실수로 `VACUUM 0 HOURS`를 실행하면 진행 중인 쿼리가 참조하는 파일까지 삭제될 수 있으므로 절대 운영 환경에서 테스트하지 말 것.
