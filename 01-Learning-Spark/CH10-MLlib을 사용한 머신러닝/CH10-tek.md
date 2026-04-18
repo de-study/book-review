@@ -1049,6 +1049,219 @@ gbt = GBTRegressor(
 | RandomForest | 병렬 앙상블 (Bagging) | 안정적, 빠름 | GBT 대비 정확도 낮음 |
 | GBT | 순차 앙상블 (Boosting) | 정확도 최고 | 학습 느림, 과적합 주의 |
 
+#### maxBins: 왜 사이킷런에는 없고 스파크에만 있는가
+
+`maxBins`는 연속형 피처를 몇 개의 구간(bin)으로 이산화해서 분기 후보를 탐색할지 결정하는 매개변수.
+사이킷런의 트리는 단일 머신에서 전체 데이터를 메모리에 올려 정확한 분기점을 직접 계산하므로 이산화가 불필요.
+스파크는 데이터가 여러 이그제큐터에 분산되어 있어 **PLANET 알고리즘**으로 분기점을 찾는데, 이 과정에서 이산화가 핵심 역할을 함.
+
+```
+왜 분산 트리에는 이산화가 필요한가
+--------------------------------------------------------------
+[사이킷런 — 단일 머신]
+  전체 데이터가 메모리에 한 번에 존재
+  price: [80, 95, 120, 150, 200, 300]
+
+  모든 값을 정렬 → 각 값 사이를 분기점 후보로 직접 탐색
+    80|95 사이에서 자르면 RSS 얼마? → 계산
+    95|120 사이에서 자르면 RSS 얼마? → 계산
+    ...
+  → 전체 데이터가 한 곳에 있으므로 가장 좋은 분기점을 정확하게 선택 가능
+  → maxBins 불필요
+
+[스파크 — PLANET 알고리즘]
+  데이터가 이그제큐터 여러 곳에 분산
+    이그제큐터A: [80, 120]
+    이그제큐터B: [95, 300]
+    이그제큐터C: [150, 200]
+
+  문제: 각 이그제큐터가 자기 데이터만 보면 전체 기준 최적 분기점을 알 수 없음
+    이그제큐터A: "80~120 사이가 최적"
+    이그제큐터B: "95~300 사이가 최적"
+    → 서로 다른 결론, 합의 불가
+
+  PLANET의 해결책: 분기 탐색 전에 전체 값 범위를 maxBins개 구간으로 이산화
+
+    [1단계] 이산화 (학습 시작 전 1회 수행)
+      전체 price 범위를 maxBins개 구간으로 나눔
+      예: maxBins=4 → 구간1:[0~100] 구간2:[100~200] 구간3:[200~300] 구간4:[300~400]
+
+    [2단계] 각 이그제큐터가 자기 데이터를 구간 번호로 변환
+      이그제큐터A: [80→구간1,  120→구간2]
+      이그제큐터B: [95→구간1,  300→구간4]
+      이그제큐터C: [150→구간2, 200→구간3]
+
+    [3단계] 드라이버가 구간별 집계 통계를 모아 최적 분기 결정
+      "구간1과 구간2 사이에서 자를 때 RSS가 가장 작다" → 해당 구간 경계를 분기점으로 선택
+
+  핵심: 구간 번호(정수)만 주고받으면 되므로 이그제큐터 간 통신 비용이 대폭 감소
+  maxBins가 클수록 구간이 세밀해져 정확하지만, 이그제큐터 간 통신/메모리 비용 증가
+
+--------------------------------------------------------------
+PLANET: Parallel Learner for Assembling Numerous Ensemble Trees
+  → 분산 환경에서 앙상블 트리를 효율적으로 학습하기 위해 설계된 알고리즘
+  → MLlib의 DecisionTree, RandomForest, GBT가 모두 이 방식을 기반으로 구현됨
+--------------------------------------------------------------
+```
+
+**maxBins와 범주형 컬럼의 관계:**
+
+`StringIndexer`로 변환된 범주형 컬럼은 정수 인덱스 값을 가짐.
+MLlib는 각 고유 인덱스 값을 하나의 분기 후보로 처리하는데,
+`maxBins`보다 카테고리 수가 많으면 모든 후보를 수용할 구간이 부족해짐.
+
+```
+maxBins 부족 시 발생하는 문제
+--------------------------------------------------------------
+예: room_type 컬럼 카테고리 50개
+    StringIndexer 적용 → room_type_index: 0~49 (50개 고유값)
+
+    maxBins = 32 (기본값)인 경우:
+      분기 후보 50개 필요 → 구간 32개만 생성 가능
+      → 일부 카테고리가 같은 구간에 묶여 구분 불가
+
+      또는 MLlib가 즉시 에러 발생:
+      "IllegalArgumentException: DecisionTree requires maxBins >= max categories in features.
+       numClasses = X, but some features have unseen labels."
+
+해결책: maxBins를 가장 카테고리 수가 많은 컬럼의 범주 수 이상으로 설정
+
+maxBins 값에 따른 트레이드오프
+--------------------------------------------------------------
+maxBins 값    분기 정확도    메모리/통신 비용    수용 가능 카테고리 수
+----------   -----------   ----------------   -------------------
+32 (기본)     낮음           낮음               32개 이하
+128           중간           중간               128개 이하
+512           높음           높음               512개 이하
+--------------------------------------------------------------
+```
+
+```python
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.sql.functions import countDistinct
+
+# 학습 데이터에서 범주형 컬럼의 최대 카테고리 수 확인
+max_categories = (
+    train_df
+    .select(countDistinct("room_type_index").alias("cnt"))
+    .first()["cnt"]
+)
+
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="price",
+    numTrees=100,
+    maxDepth=5,
+    maxBins=max(32, max_categories),  # 가장 많은 카테고리 수 이상으로 보장
+    seed=42,
+)
+```
+
+> **트러블 로그** — `maxBins`를 기본값(32)으로 두고 카테고리가 많은 컬럼을 학습하면
+> `IllegalArgumentException: DecisionTree requires maxBins >= max categories` 에러가 발생하며 학습이 즉시 중단됨.
+> 예: zip_code 컬럼에 300개의 고유 우편번호가 있는 경우 `maxBins=32`로는 학습 불가.
+> `StringIndexer` 적용 후 `train_df.agg(max("zip_code_index")).first()[0]`으로 최대 인덱스를 확인하고
+> `maxBins`를 그 값 이상으로 설정할 것. 단, 512 이상으로 올리면 셔플 데이터 크기가 커지므로
+> 고카디널리티 컬럼은 상위 N개 범주만 유지하는 방식으로 카테고리 수를 먼저 줄이는 것을 검토할 것.
+
+#### 앙상블: 랜덤 포레스트로 단일 트리의 한계를 극복하는 방법
+
+단일 의사결정 트리는 **고분산(high variance)** 문제가 있음.
+학습 데이터가 조금만 달라져도 트리 구조 자체가 완전히 바뀌어, 새로운 데이터에 대한 예측이 불안정해짐.
+
+```
+단일 트리의 고분산 문제
+--------------------------------------------------------------
+학습 데이터 A로 만든 트리:       학습 데이터 B로 만든 트리 (row2만 빠짐):
+  price > 200?                     bedrooms > 2?
+  ├─ Yes → $300                    ├─ Yes → $250
+  └─ No  → $100                    └─ No  → $120
+
+→ 데이터 하나 차이로 트리 구조가 완전히 달라짐
+→ 어떤 데이터로 학습하느냐에 따라 예측값이 크게 흔들림
+--------------------------------------------------------------
+```
+
+랜덤 포레스트는 "다양한 트리를 여러 개 만들어 평균 낸다"는 방식으로 이를 해결.
+트리가 100개 있으면 각 트리가 틀리는 방향이 서로 달라, 평균 내면 오류가 상쇄됨.
+단, 이 효과가 나오려면 **트리들이 서로 달라야 함**. 똑같은 트리를 100개 평균 내면 의미 없음.
+
+다양성을 만드는 방법이 두 가지:
+
+```
+랜덤 포레스트의 두 가지 무작위성
+==========================================================================
+
+[1] 행별 부트스트랩 샘플링 (Bootstrap Sampling)
+--------------------------------------------------------------
+복원 추출(중복 허용)로 각 트리마다 서로 다른 데이터 부분집합을 사용
+
+  전체 데이터: [row1, row2, row3, row4, row5]
+
+  트리1용 샘플: [row1, row1, row3, row4, row5]  ← row1 중복, row2 빠짐
+  트리2용 샘플: [row2, row3, row3, row4, row5]  ← row3 중복, row1 빠짐
+  트리3용 샘플: [row1, row2, row4, row4, row5]  ← row4 중복, row3 빠짐
+
+  복원 추출이므로 n개에서 n번 뽑으면 약 63%의 행만 실제로 사용됨
+  나머지 37%는 OOB(Out-of-Bag) 데이터 → 검증 세트 없이도 성능 추정에 활용 가능
+
+[2] 열별 무작위 피처 선택 (Random Feature Subsampling)
+--------------------------------------------------------------
+각 분기점을 탐색할 때 전체 피처 중 일부만 무작위로 골라 사용
+
+  이게 왜 필요한가?
+  → 모든 피처를 다 사용하면, 강력한 피처(예: 위치)가 모든 트리의
+    루트 분기를 독점 → 트리 100개가 전부 비슷한 구조 → 다양성 사라짐
+
+  전체 피처: [위치, 방크기, 층수, 방개수, 화장실수, ...] (10개)
+  각 분기마다 sqrt(10) ≈ 3개만 무작위 선택
+
+    트리1 루트 분기 후보: [방크기, 층수, 화장실수] → 3개 중 최적 선택
+    트리2 루트 분기 후보: [위치,   방개수, 방크기]  → 3개 중 최적 선택
+    트리3 루트 분기 후보: [층수,   화장실수, 위치]  → 3개 중 최적 선택
+
+  → 위치가 빠진 트리1은 방크기 기준으로 데이터를 나눔
+  → 각 트리가 서로 다른 피처 관점에서 데이터를 학습 → 구조가 다양해짐
+
+==========================================================================
+
+두 무작위성이 결합된 최종 예측
+--------------------------------------------------------------
+  트리1: row1,1,3,4,5 데이터 + 분기마다 다른 피처 → 예측 $210
+  트리2: row2,3,3,4,5 데이터 + 분기마다 다른 피처 → 예측 $185
+  트리3: row1,2,4,4,5 데이터 + 분기마다 다른 피처 → 예측 $230
+  ...
+  트리100:                                          → 예측 $195
+
+  최종 예측 (회귀) = 평균 = (210 + 185 + 230 + ... + 195) / 100 = $200
+
+  → 개별 트리가 틀려도, 틀리는 방향이 서로 달라 평균 내면 오류 상쇄
+  → 단일 트리 대비 분산이 낮고 안정적인 예측
+--------------------------------------------------------------
+```
+
+```python
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="price",
+    numTrees=100,                    # 트리 개수. 많을수록 안정적이나 학습 시간 증가
+    maxDepth=5,                      # 트리 최대 깊이
+    featureSubsetStrategy="sqrt",    # 분기마다 샘플링할 피처 수
+                                     # "sqrt"  : sqrt(전체 피처 수) — 기본 추천
+                                     # "log2"  : log2(전체 피처 수) — 피처가 매우 많을 때
+                                     # "auto"  : 회귀는 1/3, 분류는 sqrt 자동 선택
+                                     # "all"   : 전체 사용 (다양성 없음, 비추천)
+    subsamplingRate=1.0,             # 행 샘플링 비율 (1.0 = 복원 추출, 기본값)
+    seed=42,
+)
+```
+
+> **트러블 로그** — `numTrees`를 늘릴수록 성능이 올라가지만 수확 체감이 빠르게 발생함.
+> 예: `numTrees=10→50` 구간에서는 RMSE가 크게 떨어지지만, `50→200` 구간에서는 거의 변화 없으면서
+> 학습 시간만 4배 증가하는 상황이 자주 발생함.
+> `numTrees=50`으로 빠르게 방향을 잡은 뒤 `maxDepth`와 `featureSubsetStrategy`를 먼저 조정하고,
+> 마지막에 `numTrees`를 늘려 안정성을 높이는 순서로 튜닝할 것.
+
 ### 3-2. K-폴드 교차 검증
 
 학습 데이터를 K개 폴드로 나눠 K번 반복 학습/검증하여 하이퍼파라미터 성능을 안정적으로 측정.
@@ -1160,6 +1373,133 @@ train_df
     └──► bestModel.transform(test_df) → 최종 성능 측정
 --------------------------------------------------------------
 ```
+
+#### parallelism: 순차 학습 문제 해결
+
+`spark.ml`의 `CrossValidator`는 기본적으로 모델을 **순차적으로** 학습함.
+클러스터가 분산 처리를 지원해도, 하이퍼파라미터 조합들은 하나씩 순서대로 실행됨.
+`parallelism` 매개변수는 이 문제를 해결하기 위해 도입됨.
+
+```
+기본 동작 (parallelism=1) — 순차 실행
+--------------------------------------------------------------
+9개 조합 × 3-fold = 27번 학습
+
+  [조합1-fold1] → [조합1-fold2] → [조합1-fold3]
+  → [조합2-fold1] → [조합2-fold2] → ...
+  → [조합9-fold3]
+
+  한 번에 하나씩, 순서대로 실행
+  단일 학습에 10분 소요 시 → 27 × 10분 = 총 270분
+  이 동안 클러스터 일부 자원이 유휴 상태로 낭비됨
+
+parallelism=4 설정 시 — 병렬 실행
+--------------------------------------------------------------
+  라운드1: [조합1-fold1] [조합2-fold1] [조합3-fold1] [조합4-fold1]  ← 동시 실행
+  라운드2: [조합5-fold1] [조합6-fold1] [조합7-fold1] [조합8-fold1]  ← 동시 실행
+  ...
+  라운드7: [조합27-fold3]
+
+  ceil(27/4) = 7라운드 완료 → 이론상 270분 → 약 70분으로 단축
+
+주의:
+  각 모델이 클러스터 전체 자원을 100% 사용 중이라면
+  4개 동시 실행 시 각각 약 25% 자원만 받음
+  → 클러스터에 유휴 자원이 있을 때 가장 효과적
+  → 유휴 자원 없이 parallelism을 과도하게 높이면 오히려 전체 시간이 늘어날 수 있음
+--------------------------------------------------------------
+```
+
+```python
+cv = CrossValidator(
+    estimator=pipeline,
+    estimatorParamMaps=param_grid,
+    evaluator=evaluator,
+    numFolds=3,
+    parallelism=4,   # 최대 4개 모델을 동시에 학습
+                     # 클러스터 이그제큐터 수와 단일 모델 자원 소비량을 고려해 설정
+    seed=42,
+)
+```
+
+#### 전처리 중복 계산 제거: Pipeline 내부에 CrossValidator 배치
+
+기본 방식인 `CrossValidator(estimator=pipeline, ...)`는 하이퍼파라미터 조합마다
+파이프라인 전체를 처음부터 재실행함. 전처리 단계(StringIndexer, StandardScaler 등)는
+RF 하이퍼파라미터가 바뀌어도 결과가 동일한데, 불필요하게 반복 계산됨.
+
+```
+기본 방식: CrossValidator 내부에 Pipeline
+--------------------------------------------------------------
+CrossValidator(estimator=pipeline, ...)
+  pipeline = [StringIndexer, VectorAssembler, StandardScaler, RandomForest]
+
+9개 조합 × 3-fold = 27번 실행, 각 실행마다:
+  StringIndexer.fit()         ← numTrees/maxDepth와 무관한데 27번 반복
+  VectorAssembler.transform() ← 27번 반복
+  StandardScaler.fit()        ← 27번 반복
+  RandomForest.fit()          ← 실제로 조합마다 달라지는 부분
+
+전체 비용 = (전처리 비용 × 27) + (RF 학습 비용 × 27)
+
+개선된 방식: Pipeline 내부에 CrossValidator
+--------------------------------------------------------------
+cv = CrossValidator(estimator=rf, ...)   ← 모델만 넣음
+pipeline = Pipeline(stages=[StringIndexer, VectorAssembler, StandardScaler, cv])
+pipeline_model = pipeline.fit(train_df)
+
+실행 흐름:
+  StringIndexer.fit()         ← 딱 1번만 실행
+  VectorAssembler.transform() ← 딱 1번만 실행
+  StandardScaler.fit()        ← 딱 1번만 실행
+       ↓ 전처리된 데이터를 cv에 넘김
+  cv.fit(전처리된 데이터):
+    RF 조합1 학습, RF 조합2 학습, ... RF 조합27 학습
+    → RF 부분만 27번 반복
+
+전체 비용 = (전처리 비용 × 1) + (RF 학습 비용 × 27)
+
+전처리 비용이 클수록 (컬럼 수 많거나, 데이터 크기가 크거나) 절감 효과가 커짐
+--------------------------------------------------------------
+```
+
+```python
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml import Pipeline
+
+param_grid = (
+    ParamGridBuilder()
+    .addGrid(rf.numTrees, [50, 100, 200])
+    .addGrid(rf.maxDepth, [3, 5, 7])
+    .build()
+)
+
+evaluator = RegressionEvaluator(labelCol="price", predictionCol="prediction", metricName="rmse")
+
+# CrossValidator에는 모델만 넣음 (전처리 제외)
+cv = CrossValidator(
+    estimator=rf,
+    estimatorParamMaps=param_grid,
+    evaluator=evaluator,
+    numFolds=3,
+    parallelism=4,
+    seed=42,
+)
+
+# Pipeline 마지막 단계로 cv를 배치 → 전처리는 1번만 실행됨
+pipeline = Pipeline(stages=[indexer, assembler, scaler, cv])
+pipeline_model = pipeline.fit(train_df)
+
+# 최종 테스트 평가
+test_predictions = pipeline_model.transform(test_df)
+print(f"최종 RMSE: {evaluator.evaluate(test_predictions):.2f}")
+```
+
+> **트러블 로그** — `Pipeline(stages=[..., cv])` 방식으로 바꿀 때 `bestModel` 추출 경로가 달라짐.
+> 기존: `cv_model.bestModel`
+> 변경 후: `pipeline_model.stages[-1].bestModel`
+> `pipeline_model.stages[-1]`이 CrossValidatorModel이고, 거기서 `.bestModel`로 RF 모델에 접근해야 함.
+> 피처 중요도 확인 시 `pipeline_model.stages[-1].bestModel.featureImportances`로 접근할 것.
 
 ---
 
